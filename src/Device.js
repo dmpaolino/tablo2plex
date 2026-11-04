@@ -150,6 +150,81 @@ var CURRENT_STREAMS = 0;
  */
 
 /**
+ * Builds the ffmpeg argument list for a stream.
+ *
+ * Controlled by environment variables (Docker env or .env):
+ *   TRANSCODE        copy (default, no re-encode) | cpu (libx264) | vaapi (Intel/AMD GPU) | nvenc (NVIDIA GPU) | custom
+ *   VIDEO_BITRATE    target video bitrate, e.g. "3M" (default "3M")
+ *   MAX_HEIGHT       output height cap in pixels, e.g. 720 (default 720). Never upscales on cpu.
+ *   AUDIO_BITRATE    AAC stereo bitrate, e.g. "128k" (default "128k")
+ *   X264_PRESET      libx264 preset for cpu mode (default "veryfast")
+ *   VAAPI_DEVICE     render node for vaapi mode (default "/dev/dri/renderD128")
+ *   FFMPEG_OUTPUT_ARGS  for TRANSCODE=custom: space-separated output args placed between -i and -f mpegts
+ *
+ * @param {string} inputUrl
+ * @returns {string[]}
+ */
+function buildFfmpegArgs(inputUrl) {
+    const env = process.env;
+    const mode = (env.TRANSCODE || 'copy').toLowerCase();
+    const vb = env.VIDEO_BITRATE || '3M';
+    const height = parseInt(env.MAX_HEIGHT || '720', 10);
+    const ab = env.AUDIO_BITRATE || '128k';
+    const bufsize = (parseFloat(vb) * 2) + vb.replace(/[0-9.]/g, '');
+    const rate = ['-b:v', vb, '-maxrate', vb, '-bufsize', bufsize, '-g', '60'];
+    const audio = ['-c:a', 'aac', '-b:a', ab, '-ac', '2'];
+
+    const pre = [];
+    let out;
+
+    switch (mode) {
+        case 'cpu':
+            out = [
+                '-vf', `yadif=0:-1:1,scale=-2:'min(${height},ih)'`,
+                '-c:v', 'libx264', '-preset', env.X264_PRESET || 'veryfast',
+                '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+                ...rate, ...audio
+            ];
+            break;
+        case 'vaapi':
+            pre.push(
+                '-hwaccel', 'vaapi',
+                '-hwaccel_device', env.VAAPI_DEVICE || '/dev/dri/renderD128',
+                '-hwaccel_output_format', 'vaapi'
+            );
+            out = [
+                '-vf', `deinterlace_vaapi,scale_vaapi=w=-2:h=${height}`,
+                '-c:v', 'h264_vaapi',
+                ...rate, ...audio
+            ];
+            break;
+        case 'nvenc':
+            pre.push('-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda');
+            out = [
+                '-vf', `yadif_cuda=0:-1:1,scale_cuda=-2:${height}`,
+                '-c:v', 'h264_nvenc', '-preset', 'p4',
+                ...rate, ...audio
+            ];
+            break;
+        case 'custom':
+            out = (env.FFMPEG_OUTPUT_ARGS || '-c copy').trim().split(/\s+/);
+            break;
+        default:
+            out = ['-c', 'copy'];
+            break;
+    }
+
+    return [
+        ...pre,
+        '-i', inputUrl,
+        ...out,
+        '-f', 'mpegts',
+        '-v', `repeat+level+${CONST.FFMPEG_LOG_LEVEL}`,
+        'pipe:1'
+    ];
+}
+
+/**
  * Function to handle Tablo streams
  * 
  * @param {Request} req
@@ -184,13 +259,11 @@ async function handleStreams(req, res, ip, channelId, selectedChannel){
 
             Logger.debug(channelJSON);
 
-            const ffmpeg = spawn('ffmpeg', [
-                '-i', channelJSON.playlist_url,
-                '-c', 'copy',
-                '-f', 'mpegts',
-                '-v', `repeat+level+${CONST.FFMPEG_LOG_LEVEL}`,
-                'pipe:1'
-            ]);
+            const ffmpegArgs = buildFfmpegArgs(channelJSON.playlist_url);
+
+            Logger.debug(`ffmpeg ${ffmpegArgs.join(' ')}`);
+
+            const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
             if (selectedChannel.type == "ota") {
                 CURRENT_STREAMS += 1;
